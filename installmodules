@@ -1,0 +1,168 @@
+function Ensure-AzModules {
+    $needed = 'Az.Accounts','Az.Resources','Az.Compute','Az.Network','Az.Storage'
+    if ($PSVersionTable.PSEdition -ne 'Core') { try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {} }
+    try { Import-Module $needed -ErrorAction Stop | Out-Null; Write-Host "Az modules loaded." -ForegroundColor Green; return }
+    catch { Write-Warning "Module import failed: $($_.Exception.Message)" }
+    if (Get-Module AzureRM* -ListAvailable) { Write-Warning "AzureRM modules detected. They conflict with Az. Consider uninstalling AzureRM.*" }
+    try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue } catch {}
+    $toInstall = @(); foreach ($m in $needed) { if (-not (Get-Module -ListAvailable -Name $m)) { $toInstall += $m } }
+    if ($toInstall.Count -gt 0) {
+        Write-Host "Installing missing Az modules: $($toInstall -join ', ')" -ForegroundColor Yellow
+        Install-Module $toInstall -Scope CurrentUser -Force -AllowClobber
+    } else {
+        Write-Host "Reinstalling Az modules to repair load issues..." -ForegroundColor Yellow
+        Install-Module $needed -Scope CurrentUser -Force -AllowClobber
+    }
+    Import-Module $needed -Force -ErrorAction Stop | Out-Null
+    Write-Host "Az modules loaded after repair." -ForegroundColor Green
+}
+
+function Select-FromList {
+    param([array]$Items,[string]$Prompt,[string[]]$PropertyOrder)
+    if (-not $Items -or $Items.Count -eq 0) { throw "Nothing to select for: $Prompt" }
+    $ogv = Get-Command Out-GridView -ErrorAction SilentlyContinue
+    if ($ogv) {
+        $display = if ($PropertyOrder) { $Items | Select-Object -Property $PropertyOrder } else { $Items }
+        $sel = $display | Out-GridView -Title $Prompt -PassThru
+        if (-not $sel) { throw "Selection cancelled for: $Prompt" }
+        if ($PropertyOrder) {
+            $keyProp = $PropertyOrder[0]
+            return $Items | Where-Object { $_.$keyProp -eq $sel.$keyProp } | Select-Object -First 1
+        } else { return $sel }
+    } else {
+        Write-Host "`n$Prompt" -ForegroundColor Cyan
+        for ($i=0; $i -lt $Items.Count; $i++) {
+            $line = if ($PropertyOrder) { ($PropertyOrder | ForEach-Object { "$($_): $($Items[$i].$_)" }) -join ' | ' } else { $Items[$i] | Out-String }
+            Write-Host ("[{0}] {1}" -f ($i+1), $line)
+        }
+        do {
+            $raw = Read-Host "Enter number (1-$($Items.Count))"
+            $ok = [int]::TryParse($raw, [ref]$idx) -and $idx -ge 1 -and $idx -le $Items.Count
+        } until ($ok)
+        return $Items[$idx-1]
+    }
+}
+
+function Select-ValuePopup {
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter(Mandatory)][string[]]$Options,
+        [string]$Default = ''
+    )
+    $ogv = Get-Command Out-GridView -ErrorAction SilentlyContinue
+    if ($ogv) {
+        $objs = $Options | ForEach-Object { [pscustomobject]@{ Choice = $_ } }
+        $sel = $objs | Out-GridView -Title $Title -PassThru
+        if ($sel) { return $sel.Choice } else { return $Default }
+    } else {
+        Write-Host "`n$Prompt" -ForegroundColor Cyan
+        for ($i=0; $i -lt $Options.Count; $i++) { Write-Host ("[{0}] {1}" -f ($i+1), $Options[$i]) }
+        do {
+            $raw = Read-Host "Enter number (1-$($Options.Count))"
+            $ok  = [int]::TryParse($raw, [ref]$idx) -and $idx -ge 1 -and $idx -le $Options.Count
+        } until ($ok)
+        return $Options[$idx-1]
+    }
+}
+
+function Read-YesNo($Message, $DefaultYes=$true) {
+    $suffix = if ($DefaultYes) { "[Y/n]" } else { "[y/N]" }
+    $in = Read-Host "$Message $suffix"
+    if ([string]::IsNullOrWhiteSpace($in)) { return $DefaultYes }
+    return ($in -match '^[Yy]')
+}
+
+function Read-TextPopup {
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Prompt,
+        [string]$DefaultText = ''
+    )
+    try {
+        Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
+        $value = [Microsoft.VisualBasic.Interaction]::InputBox($Prompt, $Title, $DefaultText)
+        if ($null -ne $value) { return $value } else { return '' }
+    } catch { return (Read-Host "$Prompt") }
+}
+
+function Read-NameWithAllowedPrefixes {
+    param(
+        [Parameter(Mandatory)][string[]]$AllowedPrefixes,
+        [string]$Title = "New VM",
+        [string]$Prompt = "Enter VM name (must start with one of the required prefixes)"
+    )
+    try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue } catch {}
+    $prefixList = ($AllowedPrefixes -join ', ')
+    do {
+        $defaultPrefix = $AllowedPrefixes[0]
+        $name = Read-TextPopup -Title $Title -Prompt "$Prompt`nAllowed prefixes: $prefixList" -DefaultText "$defaultPrefix-"
+        if ([string]::IsNullOrWhiteSpace($name)) { throw "VM name is required." }
+        $ok = $false
+        foreach ($p in $AllowedPrefixes) {
+            if ($name.StartsWith($p, [System.StringComparison]::OrdinalIgnoreCase)) { $ok = $true; break }
+        }
+        if ($ok) { return $name }
+        try {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Name must start with one of: $prefixList`nTry again.",
+                "Naming policy",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+        } catch { Write-Warning "Name must start with one of: $prefixList" }
+    } while ($true)
+}
+
+function Ensure-ComputeProviderRegistered {
+    try {
+        $prov = Get-AzResourceProvider -ProviderNamespace Microsoft.Compute -ErrorAction Stop
+        if ($prov.RegistrationState -ne 'Registered') {
+            Write-Host "Registering resource provider Microsoft.Compute..." -ForegroundColor Yellow
+            Register-AzResourceProvider -ProviderNamespace Microsoft.Compute | Out-Null
+            Start-Sleep -Seconds 3
+        }
+    } catch { Write-Warning "Could not verify/register Microsoft.Compute provider: $($_.Exception.Message)" }
+}
+
+function Try-GetRegionVMSizes {
+    param([Parameter(Mandatory)][string]$Location)
+    Ensure-ComputeProviderRegistered
+    try {
+        $sizes = Get-AzVMSize -Location $Location -ErrorAction Stop
+        if ($sizes -and $sizes.Count -gt 0) {
+            return $sizes | Select-Object Name,
+                NumberOfCores,
+                @{n='MemoryGB';e={[math]::Round($_.MemoryInMB/1024,1)}},
+                MaxDataDiskCount,
+                @{n='IOPS';e={$null}},
+                @{n='MBps';e={$null}}
+        }
+    } catch { Write-Warning "Get-AzVMSize -Location failed: $($_.Exception.Message)" }
+    try {
+        $skus = Get-AzComputeResourceSku -Location $Location -ErrorAction Stop |
+                Where-Object { $_.ResourceType -eq 'virtualMachines' }
+        $list = foreach ($s in $skus) {
+            $cap = @{}; foreach ($c in $s.Capabilities) { $cap[$c.Name] = $c.Value }
+            $vcpu = $null
+            if ($cap.ContainsKey('vCPUs')) { $vcpu = $cap['vCPUs'] }
+            elseif ($cap.ContainsKey('vCPU')) { $vcpu = $cap['vCPU'] }
+            $memGB   = $cap['MemoryGB']
+            $maxData = $cap['MaxDataDiskCount']
+            $uncachedIOPS  = $cap['UncachedDiskIOPS']
+            $uncachedBytes = $cap['UncachedDiskBytesPerSecond']
+            if ($vcpu -and $memGB) {
+                [pscustomobject]@{
+                    Name             = $s.Name
+                    NumberOfCores    = [int]$vcpu
+                    MemoryGB         = [double]$memGB
+                    MaxDataDiskCount = if ($maxData) { [int]$maxData } else { $null }
+                    IOPS             = if ($uncachedIOPS) { [int]$uncachedIOPS } else { $null }
+                    MBps             = if ($uncachedBytes) { [math]::Round([double]$uncachedBytes/1MB,0) } else { $null }
+                }
+            }
+        }
+        if ($list -and $list.Count -gt 0) { return $list | Sort-Object Name -Unique }
+    } catch { Write-Warning "Get-AzComputeResourceSku failed: $($_.Exception.Message)" }
+    return $null
+}
